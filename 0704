@@ -1,0 +1,162 @@
+!pip install Flask pyngrok line-bot-sdk requests --quiet
+!pip install google-genai --quiet
+
+from google.colab import userdata
+
+ngrok_authtoken = userdata.get('NGROK_AUTHTOKEN')  # ngrok 驗證金鑰
+line_channel_access_token = userdata.get('LINE_CHANNEL_ACCESS_TOKEN')  # LINE Access Token
+line_channel_secret = userdata.get('LINE_CHANNEL_SECRET')  # LINE Channel Secret
+gemini_api_key = userdata.get('GEMINI_API_KEY')  # Gemini API Key
+port = 5051  # Flask 執行埠號
+
+import os
+from pyngrok import ngrok
+
+ngrok.kill()  # 關閉舊的 ngrok 通道
+
+import requests
+
+ngrok.set_auth_token(ngrok_authtoken)  # 設定 ngrok 驗證資訊
+tunnel = ngrok.connect(5051, name="linebot_tunnel")  # 建立公開網址
+webhook_url = tunnel.public_url  # 取得公開網址
+
+print(f"Ngrok URL: {webhook_url}")  # 顯示 ngrok 網址
+
+# 自動更新 LINE Webhook URL
+def update_line_webhook(webhook_url):
+    """使用 LINE Messaging API 更新 Webhook URL"""
+
+    url = "https://api.line.me/v2/bot/channel/webhook/endpoint"  # LINE Webhook API
+
+    headers = {
+        "Authorization": f"Bearer {line_channel_access_token}",  # 驗證 Token
+        "Content-Type": "application/json"
+    }
+
+    data = {
+        "endpoint": webhook_url  # 新的 Webhook 網址
+    }
+
+    response = requests.put(url, headers=headers, json=data)  # 發送更新請求
+
+    if response.status_code == 200:
+        print(f"✅ LINE Webhook URL 已自動更新為：{webhook_url}")
+        return True
+    else:
+        print(f"❌ 更新失敗：{response.status_code} - {response.text}")
+        return False
+
+update_line_webhook(webhook_url)  # 執行更新
+
+from google import genai
+from google.genai.types import Tool, GenerateContentConfig, GoogleSearch
+
+client = genai.Client(api_key=gemini_api_key)  # 建立 Gemini Client
+
+google_search_tool = Tool(
+   google_search=GoogleSearch()  # 啟用 Google 搜尋工具
+)
+
+chat = client.chats.create(
+    model="gemini-2.5-flash",  # 使用 Gemini 2.5 Flash 模型
+    config=GenerateContentConfig(
+        system_instruction="你是一個中文的AI助手，請用繁體中文回答",  # 系統提示詞
+        tools=[google_search_tool],  # 啟用網路搜尋
+        response_modalities=["TEXT"],  # 回傳文字
+    )
+)
+
+def stateful_query(payload):
+    response = chat.send_message(message=payload)  # 傳送訊息給 Gemini
+    return response.text  # 回傳回答內容
+
+result = stateful_query("簡介明新科技大學")  # 測試 Gemini
+print(result)
+
+result2 = stateful_query("校長是誰？")  # 測試記憶功能
+print(result2)
+
+from flask import Flask, request, abort
+
+from linebot.v3 import (
+    WebhookHandler
+)
+
+from linebot.v3.exceptions import (
+    InvalidSignatureError
+)
+
+from linebot.v3.messaging import (
+    Configuration,
+    ApiClient,
+    MessagingApi,
+    ReplyMessageRequest,
+    TextMessage,
+)
+
+from linebot.v3.webhooks import (
+    MessageEvent,
+    TextMessageContent,
+)
+
+app = Flask(__name__)  # 建立 Flask 應用程式
+
+configuration = Configuration(access_token=line_channel_access_token)  # LINE Bot 設定
+handler = WebhookHandler(line_channel_secret)  # 建立 Webhook Handler
+
+@app.route("/", methods=['POST'])
+def callback():
+
+    signature = request.headers['X-Line-Signature']  # 取得 LINE 簽章
+
+    body = request.get_data(as_text=True)  # 取得請求內容
+
+    print("BODY: ", body)
+
+    app.logger.info("Request body: " + body)
+
+    try:
+        handler.handle(body, signature)  # 驗證並處理訊息
+
+    except InvalidSignatureError:
+        app.logger.info("Invalid signature.")
+        abort(400)
+
+    return 'OK'
+
+@handler.add(MessageEvent, message=TextMessageContent)
+def handle_message(event):
+
+    text = event.message.text  # 取得使用者訊息
+
+    with ApiClient(configuration) as api_client:
+
+        line_bot_api = MessagingApi(api_client)
+
+        if text.startswith('AI '):  # 判斷是否使用 AI 功能
+
+            prompt = text[3:]  # 去除 AI 前綴
+
+            reply_text = stateful_query(prompt)  # 呼叫 Gemini
+
+            line_bot_api.reply_message_with_http_info(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[TextMessage(text=reply_text)]  # 回覆 AI 結果
+                )
+            )
+
+        else:
+
+            line_bot_api.reply_message_with_http_info(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[
+                        TextMessage(text=event.message.text),  # 回覆一次
+                        TextMessage(text=event.message.text)   # 再回覆一次
+                    ]
+                )
+            )
+
+if __name__ == "__main__":
+    app.run(port=port)  # 啟動 Flask Server
