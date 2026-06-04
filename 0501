@@ -1,0 +1,136 @@
+# 安裝所需套件
+!pip install Flask pyngrok line-bot-sdk requests --quiet
+!pip install google-genai --quiet
+
+# 從 Colab Secrets 讀取金鑰資訊
+from google.colab import userdata
+
+ngrok_authtoken = userdata.get('NGROK_AUTHTOKEN')               # ngrok 驗證金鑰
+line_channel_access_token = userdata.get('LINE_CHANNEL_ACCESS_TOKEN')  # LINE Access Token
+line_channel_secret = userdata.get('LINE_CHANNEL_SECRET')      # LINE Channel Secret
+google_gemini_api_key = userdata.get('GEMINI_API_KEY')         # Gemini API Key
+port = 5051                                                    # Flask 執行埠號
+
+# 載入 ngrok 套件
+import os
+from pyngrok import ngrok
+
+# 關閉舊的 ngrok 通道，避免重複建立
+ngrok.kill()
+
+import requests
+
+# 設定 ngrok 驗證資訊
+ngrok.set_auth_token(ngrok_authtoken)
+
+# 建立公開網址供 LINE Webhook 存取
+tunnel = ngrok.connect(5051, name="linebot_tunnel")
+webhook_url = tunnel.public_url
+
+print(f"Ngrok URL: {webhook_url}")
+
+# 自動更新 LINE Developers 的 Webhook URL
+def update_line_webhook(webhook_url):
+
+    # LINE Webhook API
+    url = "https://api.line.me/v2/bot/channel/webhook/endpoint"
+
+    # API 請求標頭
+    headers = {
+        "Authorization": f"Bearer {line_channel_access_token}",
+        "Content-Type": "application/json"
+    }
+
+    # 傳送新的 Webhook 網址
+    data = {
+        "endpoint": webhook_url
+    }
+
+    # 發送更新請求
+    response = requests.put(url, headers=headers, json=data)
+
+    # 顯示更新結果
+    if response.status_code == 200:
+        print(f"✅ LINE Webhook URL 已更新：{webhook_url}")
+        return True
+    else:
+        print(f"❌ 更新失敗：{response.status_code} - {response.text}")
+        return False
+
+# 執行更新
+update_line_webhook(webhook_url)
+
+# 載入 Flask 與 LINE SDK
+from flask import Flask, request, abort
+
+from linebot.v3 import WebhookHandler
+from linebot.v3.exceptions import InvalidSignatureError
+
+from linebot.v3.messaging import (
+    Configuration,
+    ApiClient,
+    MessagingApi,
+    ReplyMessageRequest,
+    TextMessage,
+)
+
+from linebot.v3.webhooks import (
+    MessageEvent,
+    TextMessageContent,
+)
+
+# 建立 Flask 應用程式
+app = Flask(__name__)
+
+# 設定 LINE Bot 連線資訊
+configuration = Configuration(access_token=line_channel_access_token)
+
+# 建立 Webhook 處理器
+handler = WebhookHandler(line_channel_secret)
+
+# Webhook 接收端點
+@app.route("/", methods=['POST'])
+def callback():
+
+    # 取得 LINE 簽章
+    signature = request.headers['X-Line-Signature']
+
+    # 取得請求內容
+    body = request.get_data(as_text=True)
+
+    print("BODY:", body)
+
+    # 驗證請求是否合法
+    try:
+        handler.handle(body, signature)
+
+    except InvalidSignatureError:
+        abort(400)
+
+    return 'OK'
+
+# 接收文字訊息事件
+@handler.add(MessageEvent, message=TextMessageContent)
+def handle_message(event):
+
+    print("EVENT:", event)
+
+    # 建立 LINE API 客戶端
+    with ApiClient(configuration) as api_client:
+
+        line_bot_api = MessagingApi(api_client)
+
+        # 回覆使用者訊息
+        line_bot_api.reply_message_with_http_info(
+            ReplyMessageRequest(
+                reply_token=event.reply_token,
+                messages=[
+                    TextMessage(text=event.message.text),
+                    TextMessage(text=event.message.text)
+                ]
+            )
+        )
+
+# 啟動 Flask 伺服器
+if __name__ == "__main__":
+    app.run(port=port)
