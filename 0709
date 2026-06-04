@@ -1,0 +1,362 @@
+# 匯入 Web 微框架 Flask 與網路請求相關模組
+from flask import Flask, request, abort
+import logging
+import os
+import time
+import requests
+
+# 匯入 Google GenAI SDK (最新版 v1 規範)
+from google import genai
+from google.genai import types
+from google.genai.types import Tool, GenerateContentConfig, GoogleSearch
+
+# 匯入 Google Colab 安全金鑰讀取工具
+from google.colab import userdata
+
+# 匯入 pyngrok (用於將本地 Port 映射至外網，方便 LINE Webhook 測試)
+from pyngrok import ngrok
+
+# 匯入 LINE Bot SDK v3 相關模組
+from linebot.v3 import (
+    WebhookHandler
+)
+from linebot.v3.exceptions import (
+    InvalidSignatureError
+)
+from linebot.v3.messaging import (
+    Configuration,
+    ApiClient,
+    MessagingApi,
+    MessagingApiBlob,
+    ReplyMessageRequest,
+    TextMessage
+)
+from linebot.v3.webhooks import (
+    MessageEvent,
+    TextMessageContent,
+    FileMessageContent
+)
+
+# 2. 讀取環境變數與參數設定
+
+# 從 Colab 的 Secrets (左側鑰匙圖示) 讀取機密金鑰
+ngrok_authtoken = userdata.get('NGROK_AUTHTOKEN')
+line_channel_access_token = userdata.get('LINE_CHANNEL_ACCESS_TOKEN')
+line_channel_secret = userdata.get('LINE_CHANNEL_SECRET')
+gemini_api_key = userdata.get('GEMINI_API_KEY')
+
+# 定義 Flask 應用程式與 Ngrok 隧道要使用的通訊埠 (Port)
+port = 5051
+
+# 3. Ngrok 隧道建立與 LINE Webhook 自動更新
+
+# 先中斷並關閉所有既有的 ngrok 隧道，避免 Port 衝突
+ngrok.kill()
+
+# 設定 Ngrok 驗證權杖並開啟隧道
+ngrok.set_auth_token(ngrok_authtoken)
+tunnel = ngrok.connect(port, name="linebot_tunnel")
+webhook_url = tunnel.public_url # 取得 ngrok 產生的 https 外部網址
+print(f"Ngrok URL: {webhook_url}")
+
+def update_line_webhook(webhook_url):
+    """
+    透過 LINE Messaging API，自動將 LINE Developer 後台的 
+    Webhook URL 更新為當前最新的 Ngrok 網址，省去手動複製貼上的麻煩。
+    """
+    url = "https://api.line.me/v2/bot/channel/webhook/endpoint"
+    headers = {
+        "Authorization": f"Bearer {line_channel_access_token}",
+        "Content-Type": "application/json"
+    }
+    data = {
+        "endpoint": webhook_url # LINE 伺服器要求必須是 https 網址
+    }
+    
+    # 向 LINE 伺服器發送 PUT 請求更新端點
+    response = requests.put(url, headers=headers, json=data)
+    
+    if response.status_code == 200:
+        print(f"✅ LINE Webhook URL 已自動更新為：{webhook_url}")
+        return True
+    else:
+        print(f"❌ 更新失敗：{response.status_code} - {response.text}")
+        return False
+
+# 執行 LINE 後台 Webhook URL 的自動更新
+update_line_webhook(webhook_url)
+
+# 4. 初始化 Google Gemini 客戶端與搜尋工具
+
+# 初始化 Gemini 客戶端
+client = genai.Client(api_key=gemini_api_key)
+
+# 建立 Google 搜尋工具物件 (讓 Gemini 具備聯網查詢即時資訊的能力)
+google_search_tool = Tool(
+   google_search=GoogleSearch()
+)
+
+# 5. Flask 應用程式初始化與狀態變數設定
+
+# 建立 Flask 實例
+app = Flask(__name__)
+
+# 設定日誌 (Logging) 格式，方便在 Colab 主機上追蹤流量與排錯
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+app.logger.setLevel(logging.INFO)
+
+# 載入 LINE Bot SDK 的基本組態與簽章驗證器
+configuration = Configuration(access_token=line_channel_access_token)
+handler = WebhookHandler(line_channel_secret)
+
+# 設定從 LINE 聊天室下載下來的檔案暫存目錄
+UPLOAD_DIR = "/content/uploaded_files"
+os.makedirs(UPLOAD_DIR, exist_ok=True) # 若目錄不存在則自動建立
+
+# 【核心狀態字典】用來保存每個 LINE 使用者的專屬 Session
+# 結構設計：{ "user_id": { "chat": chat_object, "uploaded_file": gemini_file_object } }
+user_sessions = {}  
+
+# 6. 核心輔助函式 (Session 管理、檔案處理、RAG 路由)
+
+def get_user_session(user_id):
+    """
+    獲取或初始化該使用者的獨立對話與狀態。
+    確保多個使用者同時使用 Bot 時，對話歷史和上傳的文件不會互相干擾。
+    """
+    if user_id not in user_sessions:
+        # 為新使用者建立獨立的 Gemini 聊天對話實例 (具備記憶上下文能力)
+        new_chat = client.chats.create(
+            model="gemini-2.5-flash",
+            config=GenerateContentConfig(
+                system_instruction="你是一個中文的AI助手，請用繁體中文回答。如果使用者有提供參考文件，請根據文件內容回答問題。",
+                tools=[google_search_tool], # 綁定聯網搜尋功能
+                response_modalities=["TEXT"], # 限制回應為純文字
+            )
+        )
+        # 初始化該使用者的狀態
+        user_sessions[user_id] = {
+            "chat": new_chat,
+            "uploaded_file": None # 剛開始尚未上傳任何 RAG 文件
+        }
+    return user_sessions[user_id]
+
+def download_line_file(message_id, file_name):
+    """
+    藉由 LINE 訊息 ID，將使用者上傳至 LINE 伺服器的檔案串流下載到 Colab 本地端。
+    """
+    with ApiClient(configuration) as api_client:
+        line_bot_blob_api = MessagingApiBlob(api_client)
+        # 獲取二進位檔案內容
+        file_content = line_bot_blob_api.get_message_content(message_id)
+        
+        # 串接本地儲存路徑
+        file_path = os.path.join(UPLOAD_DIR, file_name)
+        
+        # 寫入檔案
+        with open(file_path, 'wb') as f:
+            f.write(file_content)
+        
+        return file_path
+
+def upload_file_to_gemini(file_path):
+    """
+    將本地的檔案上傳到 Gemini Files API。
+    Gemini 支援直接讀取 PDF、TXT 等多種格式，非常適合直接拿來做大型 RAG 分析。
+    """
+    uploaded_file = client.files.upload(
+        file=file_path,
+        config={'display_name': os.path.basename(file_path)} # 設定雲端顯示名稱
+    )
+    
+    # 輪詢機制 (Polling)：等待 Gemini 伺服器將檔案解析並建立索引完成
+    while uploaded_file.state.name == "PROCESSING":
+        print("檔案處理中...")
+        time.sleep(1) # 每秒檢查一次狀態
+        uploaded_file = client.files.get(name=uploaded_file.name)
+    
+    if uploaded_file.state.name == "FAILED":
+        raise Exception("檔案上傳處理失敗")
+    
+    return uploaded_file
+
+def query_with_rag(user_id, question):
+    """
+    策略路由控制：根據使用者當前有沒有綁定上傳檔案，自動切換 RAG 模式或一般對話。
+    """
+    session = get_user_session(user_id)
+    uploaded_file = session["uploaded_file"]
+    
+    if uploaded_file:
+        # 【A 模式：RAG 知識庫問答】
+        # 由於需要將文件作為上下文傳入，此處採用一次性生成方式 (generate_content)
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=[
+                types.Content(
+                    role="user",
+                    parts=[
+                        # 傳入 Gemini 雲端檔案的專屬內部位址 (URI) 與類型
+                        types.Part.from_uri(
+                            file_uri=uploaded_file.uri,
+                            mime_type=uploaded_file.mime_type
+                        ),
+                        # 注入使用者的提問
+                        types.Part.from_text(text=f"請根據上述提供的檔案內容，用繁體中文回答這個問題：{question}")
+                    ]
+                )
+            ]
+        )
+        return response.text
+    else:
+        # 【B 模式：標準多輪對話】
+        # 使用有歷史紀錄記憶記憶功能的 chat.send_message 進行回應
+        response = session["chat"].send_message(message=question)
+        return response.text
+
+# 7. Flask 接收端點 (Webhook Callback)
+
+@app.route("/", methods=['POST'])
+def callback():
+    """
+    這是當 LINE 官方伺服器有新事件時，會呼叫的 Webhook 主進入點。
+    """
+    # 取得安全驗證所需的 LINE 數位簽章標頭
+    signature = request.headers['X-Line-Signature']
+    # 取得請求的字串主體
+    body = request.get_data(as_text=True)
+    print("BODY: ", body)
+    app.logger.info("Request body: " + body)
+
+    try:
+        # 將資料交給 WebhookHandler 進行數位簽章比對與事件派發
+        handler.handle(body, signature)
+    except InvalidSignatureError:
+        # 簽章不符（例如遭受外部惡意攻擊發送偽造請求時），阻擋並回應 400 錯誤
+        app.logger.info("Invalid signature.")
+        abort(400)
+
+    return 'OK'
+
+# 8. LINE 事件監聽：處理文字訊息
+
+@handler.add(MessageEvent, message=TextMessageContent)
+def handle_message(event):
+    """
+    監聽事件：當使用者在聊天室輸入「文字」時會觸發此函式。
+    """
+    text = event.message.text         # 讀取文字內容
+    user_id = event.source.user_id    # 識別該用戶的 Unique ID
+    
+    with ApiClient(configuration) as api_client:
+        line_bot_api = MessagingApi(api_client)
+        
+        # 指令判斷 1：如果訊息是以 'AI ' 開頭 (必須包含空格)
+        if text.startswith('AI '):
+            prompt = text[3:] # 剝離前綴，取出真正的問題
+            try:
+                # 調用整合路由獲取答案
+                reply_text = query_with_rag(user_id, prompt)
+                
+                # 額外體驗優化：如果目前處於 RAG 文件模式，在回覆開頭加上標記提示用戶
+                session = get_user_session(user_id)
+                if session["uploaded_file"]:
+                    reply_text = f"📄 [RAG 模式]\n\n{reply_text}"
+                
+                # 將產生的文字包裝成 LINE 訊息格式回傳
+                line_bot_api.reply_message_with_http_info(
+                    ReplyMessageRequest(
+                        reply_token=event.reply_token,
+                        messages=[TextMessage(text=reply_text)]
+                    )
+                )
+            except Exception as e:
+                # 當 AI 生成或 API 出現錯誤時的保護防禦，將錯誤訊息傳回給用戶
+                line_bot_api.reply_message_with_http_info(
+                    ReplyMessageRequest(
+                        reply_token=event.reply_token,
+                        messages=[TextMessage(text=f"❌ 發生錯誤：{str(e)}")]
+                    )
+                )
+                
+        # 指令判斷 2：如果使用者輸入「清除文件」
+        elif text == "清除文件":
+            session = get_user_session(user_id)
+            session["uploaded_file"] = None # 移除綁定的檔案，讓狀態歸零
+            
+            line_bot_api.reply_message_with_http_info(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[TextMessage(text="✅ 已清除上傳的文件，恢復一般對話模式。")]
+                )
+            )
+            
+        # 指令判斷 3：其他格式不符的文字訊息（如單純哈囉、打招呼等）
+        else:
+            # 推播功能提示選單，導引使用者正確的操作格式
+            line_bot_api.reply_message_with_http_info(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[TextMessage(text="請輸入「AI 問題」來開始對話\n或上傳 TXT/PDF 檔案啟用 RAG 模式")]
+                )
+            )
+
+# 9. LINE 事件監聽：處理檔案上傳
+
+@handler.add(MessageEvent, message=FileMessageContent)
+def handle_file_message(event):
+    """
+    監聽事件：當使用者在聊天室點選「傳送檔案」上傳文件時會觸發此函式。
+    """
+    user_id = event.source.user_id
+    file_name = event.message.file_name # 獲取上傳檔案的原始名稱
+    
+    with ApiClient(configuration) as api_client:
+        line_bot_api = MessagingApi(api_client)
+        
+        # 安全機制：限制檔案格式，目前只放行 TXT 或 PDF
+        if not (file_name.endswith('.txt') or file_name.endswith('.pdf')):
+            line_bot_api.reply_message_with_http_info(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[TextMessage(text="⚠️ 目前只支援 TXT 或 PDF 檔案")]
+                )
+            )
+            return # 攔截並結束函式
+        
+        try:
+            # 步驟 1：將檔案從 LINE 伺服器下載到 Colab 本地
+            file_path = download_line_file(event.message.id, file_name)
+            print(f"檔案已下載：{file_path}")
+            
+            # 步驟 2：將本地檔案推送到 Google Gemini Cloud 空間
+            uploaded_file = upload_file_to_gemini(file_path)
+            print(f"檔案已上傳到 Gemini：{uploaded_file.uri}")
+            
+            # 步驟 3：將該上傳成功的文件物件，塞入對應使用者的狀態 Session 中
+            session = get_user_session(user_id)
+            session["uploaded_file"] = uploaded_file
+            
+            # 步驟 4：回報用戶上傳成功，並引導下一步操作指令
+            line_bot_api.reply_message_with_http_info(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[TextMessage(text=f"✅ 檔案「{file_name}」上傳成功！\n\n現在您可以輸入「AI 問題」來詢問關於這份文件的問題。\n\n輸入「清除文件」可恢復一般對話模式。")]
+                )
+            )
+        except Exception as e:
+            # 如果在下載、上傳或輪詢期間發生任何異常，捕捉並反饋給用戶
+            line_bot_api.reply_message_with_http_info(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[TextMessage(text=f"❌ 檔案處理失敗：{str(e)}")]
+                )
+            )
+
+
+# 10. 程式執行進入點
+
+if __name__ == "__main__":
+    # 啟動 Flask 本地網頁伺服器，並開放在前面指定的 5051 通訊埠
+    app.run(port=port)
