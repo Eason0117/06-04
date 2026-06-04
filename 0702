@@ -1,0 +1,249 @@
+!pip install Flask pyngrok line-bot-sdk requests --quiet
+!pip install google-genai --quiet
+
+
+# 讀取 Google Colab Secrets 中儲存的金鑰
+from google.colab import userdata
+
+# ngrok 驗證金鑰
+ngrok_authtoken = userdata.get('NGROK_AUTHTOKEN')
+
+# LINE Bot Access Token
+line_channel_access_token = userdata.get('LINE_CHANNEL_ACCESS_TOKEN')
+
+# LINE Bot Secret
+line_channel_secret = userdata.get('LINE_CHANNEL_SECRET')
+
+# Gemini API 金鑰
+gemini_api_key = userdata.get('GEMINI_API_KEY')
+
+# Flask 執行 Port
+port = 5051
+
+
+# 匯入 ngrok 套件
+import os
+from pyngrok import ngrok
+
+# 關閉既有 ngrok Tunnel
+ngrok.kill()
+
+import requests
+
+
+# 設定 ngrok 驗證 Token
+ngrok.set_auth_token(ngrok_authtoken)
+
+# 建立公開網址
+tunnel = ngrok.connect(5051, name="linebot_tunnel")
+
+# 取得公開網址
+webhook_url = tunnel.public_url
+
+print(f"Ngrok URL: {webhook_url}")
+
+
+# 自動更新 LINE Developers Webhook URL
+def update_line_webhook(webhook_url):
+
+    # LINE Messaging API Webhook Endpoint
+    url = "https://api.line.me/v2/bot/channel/webhook/endpoint"
+
+    # API Header
+    headers = {
+        "Authorization": f"Bearer {line_channel_access_token}",
+        "Content-Type": "application/json"
+    }
+
+    # 傳送新的 Webhook URL
+    data = {
+        "endpoint": webhook_url
+    }
+
+    # 發送 PUT 請求
+    response = requests.put(
+        url,
+        headers=headers,
+        json=data
+    )
+
+    # 判斷更新結果
+    if response.status_code == 200:
+        print(f"✅ LINE Webhook URL 已自動更新為：{webhook_url}")
+        return True
+    else:
+        print(f"❌ 更新失敗：{response.status_code} - {response.text}")
+        return False
+
+
+# 執行 Webhook 更新
+update_line_webhook(webhook_url)
+
+
+# ==========================
+# Gemini AI 設定
+# ==========================
+from google import genai
+from google.genai.types import Tool, GenerateContentConfig, GoogleSearch
+
+# 建立 Gemini Client
+client = genai.Client(api_key=gemini_api_key)
+
+# 建立聊天 Session
+# Stateful Chat 會保留上下文記憶
+chat = client.chats.create(
+    model="gemini-2.5-flash",
+    config=GenerateContentConfig(
+        response_modalities=["TEXT"],
+    )
+)
+
+
+# 建立具有記憶功能的問答函式
+def stateful_query(payload):
+
+    # 將訊息送給 Gemini
+    response = chat.send_message(
+        message=payload
+    )
+
+    # 回傳 AI 回答
+    return response.text
+
+
+# 測試 Gemini 記憶功能
+result = stateful_query("簡介明新科技大學")
+print(result)
+
+result2 = stateful_query("校長是誰？")
+print(result2)
+
+
+# ==========================
+# Flask 與 LINE SDK
+# ==========================
+from flask import Flask, request, abort
+
+from linebot.v3 import WebhookHandler
+
+from linebot.v3.exceptions import (
+    InvalidSignatureError
+)
+
+from linebot.v3.messaging import (
+    Configuration,
+    ApiClient,
+    MessagingApi,
+    ReplyMessageRequest,
+    TextMessage,
+)
+
+from linebot.v3.webhooks import (
+    MessageEvent,
+    TextMessageContent,
+)
+
+
+# 建立 Flask 應用程式
+app = Flask(__name__)
+
+# LINE Bot 設定
+configuration = Configuration(
+    access_token=line_channel_access_token
+)
+
+# Webhook Handler
+handler = WebhookHandler(
+    line_channel_secret
+)
+
+
+# LINE Webhook 接收端
+@app.route("/", methods=['POST'])
+def callback():
+
+    # 取得 LINE Signature
+    signature = request.headers['X-Line-Signature']
+
+    # 取得請求內容
+    body = request.get_data(as_text=True)
+
+    print("BODY:", body)
+
+    app.logger.info(
+        "Request body: " + body
+    )
+
+    try:
+        # 驗證請求是否合法
+        handler.handle(body, signature)
+
+    except InvalidSignatureError:
+
+        app.logger.info(
+            "Invalid signature."
+        )
+
+        abort(400)
+
+    return 'OK'
+
+
+# 接收使用者文字訊息
+@handler.add(
+    MessageEvent,
+    message=TextMessageContent
+)
+def handle_message(event):
+
+    # 取得使用者輸入
+    text = event.message.text
+
+    with ApiClient(configuration) as api_client:
+
+        line_bot_api = MessagingApi(api_client)
+
+        # AI 指令模式
+        if text.startswith('AI '):
+
+            # 去除 AI 前綴字串
+            prompt = text[3:]
+
+            # 傳送給 Gemini
+            reply_text = stateful_query(prompt)
+
+            # 回覆 Gemini 結果
+            line_bot_api.reply_message_with_http_info(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[
+                        TextMessage(
+                            text=reply_text
+                        )
+                    ]
+                )
+            )
+
+        else:
+
+            # 一般模式
+            # 將訊息重複回覆兩次
+            line_bot_api.reply_message_with_http_info(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[
+                        TextMessage(
+                            text=event.message.text
+                        ),
+                        TextMessage(
+                            text=event.message.text
+                        )
+                    ]
+                )
+            )
+
+
+# 啟動 Flask Server
+if __name__ == "__main__":
+    app.run(port=port)
+```
